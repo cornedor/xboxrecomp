@@ -1110,6 +1110,13 @@ extern volatile uint64_t g_icall_guard_misses;
            recomp_icall_fail_log(_va); g_esp += 4; g_eax = 0; } \
 } while(0)
 
+/* Preemption point at every loop head (emitted by tools/recomp). Counts
+ * iterations per thread and, every RECOMP_LOOP_QUANTUM of them, lets other
+ * guest threads have the guest CPU when the lock is on (kernel_bridge.c). */
+extern RECOMP_TLS int g_loop_budget;
+void recomp_loop_yield(void);
+#define RECOMP_LOOP_YIELD() do { if (--g_loop_budget < 0) recomp_loop_yield(); } while (0)
+
 /* ================================================================
  * Register name aliases for generated code
  *
