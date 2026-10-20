@@ -70,5 +70,8 @@ int  xbox_FramebufferDumpBmp(const char *path);
  * UTF-16 title (40 chars max); the stats come from each flip. */
 void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars);
 void xbox_FramebufferWindowFrameStats(uint32_t draws);
+/* The title's display gamma ramp (256 entries each), applied when presenting
+ * (fb_gamma.c). */
+void xbox_FramebufferSetGammaRamp(const uint8_t *r, const uint8_t *g, const uint8_t *b);
 
 #endif /* BURNOUT3_VIDEO_PLAYER_H */
