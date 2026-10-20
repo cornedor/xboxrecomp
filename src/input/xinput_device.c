@@ -13,6 +13,135 @@
 #include "xinput_xbox.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+
+
+/* ---- bindings: keys.ini ---------------------------------------------------
+ *
+ * Every control's keyboard key and controller source, with today's defaults,
+ * overridable from keys.ini in the working directory (RECOMP_KEYS=<file>
+ * names another). One binding per line, '#' or ';' starts a comment:
+ *
+ *   a = Space            keyboard: a letter/digit, Enter Space Backspace Tab
+ *   start = Enter        Shift Ctrl Alt Esc Up Down Left Right Home End
+ *   lstick_left = Left   PageUp PageDown Insert Delete Numpad0-9 F1-F12, 0xNN
+ *   pad.black = rb       controller: up down left right start back ls rs
+ *   pad.white = lb       a b x y lb rb lt rt (buttons only; sticks stay)
+ *
+ * Controls: up down left right start back ls rs a b x y black white lt rt,
+ * and for keys also lstick_left/right/up/down, rstick_left/right/up/down.
+ * Read once, the first time input is asked for; each line is logged. */
+enum { C_UP, C_DOWN, C_LEFT, C_RIGHT, C_START, C_BACK, C_LS, C_RS,
+       C_A, C_B, C_X, C_Y, C_BLACK, C_WHITE, C_LT, C_RT,
+       C_LSL, C_LSR, C_LSD, C_LSU, C_RSL, C_RSR, C_RSD, C_RSU, C_COUNT };
+static const char *const k_ctl[C_COUNT] = {
+    "up", "down", "left", "right", "start", "back", "ls", "rs",
+    "a", "b", "x", "y", "black", "white", "lt", "rt",
+    "lstick_left", "lstick_right", "lstick_down", "lstick_up",
+    "rstick_left", "rstick_right", "rstick_down", "rstick_up" };
+/* VK codes (numeric: the SDL build has no winuser.h) */
+static int s_key[C_COUNT] = {
+    0x26, 0x28, 0x25, 0x27, 0x0D, 0x08, 0x10, 0x11,
+    'Z', 'X', 'A', 'S', 'E', 'Q', '1', '3',
+    0x64, 0x66, 0x62, 0x68, 'J', 'L', 'K', 'I' };
+enum { P_UP, P_DOWN, P_LEFT, P_RIGHT, P_START, P_BACK, P_LS, P_RS,
+       P_A, P_B, P_X, P_Y, P_LB, P_RB, P_LT, P_RT, P_COUNT };
+static const char *const k_src[P_COUNT] = {
+    "up", "down", "left", "right", "start", "back", "ls", "rs",
+    "a", "b", "x", "y", "lb", "rb", "lt", "rt" };
+static int s_pad[C_RT + 1] = {
+    P_UP, P_DOWN, P_LEFT, P_RIGHT, P_START, P_BACK, P_LS, P_RS,
+    P_A, P_B, P_X, P_Y, P_LB, P_RB, P_LT, P_RT };
+
+static int key_code(const char *n)
+{
+    static const struct { const char *n; int vk; } t[] = {
+        {"enter", 0x0D}, {"return", 0x0D}, {"space", 0x20}, {"backspace", 0x08},
+        {"tab", 0x09}, {"shift", 0x10}, {"ctrl", 0x11}, {"control", 0x11},
+        {"alt", 0x12}, {"esc", 0x1B}, {"escape", 0x1B}, {"up", 0x26},
+        {"down", 0x28}, {"left", 0x25}, {"right", 0x27}, {"home", 0x24},
+        {"end", 0x23}, {"pageup", 0x21}, {"pagedown", 0x22}, {"insert", 0x2D},
+        {"delete", 0x2E},
+    };
+    size_t i;
+    if (n[0] && !n[1]) {
+        char c = n[0];
+        if (c >= 'a' && c <= 'z') return c - 'a' + 'A';
+        if (c >= '0' && c <= '9') return c;
+        return 0;
+    }
+    if (n[0] == '0' && n[1] == 'x') return (int)strtol(n, NULL, 16);
+    if (!strncmp(n, "numpad", 6) && n[6] >= '0' && n[6] <= '9' && !n[7]) return 0x60 + n[6] - '0';
+    if (n[0] == 'f' && n[1] >= '1' && n[1] <= '9') {
+        int k = atoi(n + 1);
+        if (k >= 1 && k <= 12) return 0x6F + k;
+    }
+    for (i = 0; i < sizeof t / sizeof t[0]; i++)
+        if (!strcmp(n, t[i].n)) return t[i].vk;
+    return 0;
+}
+
+static void bindings_load(void)
+{
+    static int done;
+    const char *path;
+    char line[256];
+    FILE *f;
+    int n = 0;
+    if (done)
+        return;
+    done = 1;
+    path = getenv("RECOMP_KEYS");
+    if (!path || !*path)
+        path = "keys.ini";
+    if (!(f = fopen(path, "r")))
+        return;
+    while (fgets(line, sizeof line, f)) {
+        char *p, *name, *val, *e;
+        int i, c = -1, pad = 0;
+        for (p = line; *p; p++) {
+            if (*p == '#' || *p == ';' || *p == '\r' || *p == '\n') { *p = 0; break; }
+            if (*p >= 'A' && *p <= 'Z') *p = (char)(*p - 'A' + 'a');
+        }
+        if (!(e = strchr(line, '=')))
+            continue;
+        *e = 0;
+        name = line; val = e + 1;
+        while (*name == ' ' || *name == '\t') name++;
+        while (*val == ' ' || *val == '\t') val++;
+        for (e = name + strlen(name); e > name && (e[-1] == ' ' || e[-1] == '\t'); ) *--e = 0;
+        for (e = val + strlen(val); e > val && (e[-1] == ' ' || e[-1] == '\t'); ) *--e = 0;
+        if (!strncmp(name, "pad.", 4)) { pad = 1; name += 4; }
+        for (i = 0; i < C_COUNT; i++)
+            if (!strcmp(name, k_ctl[i])) { c = i; break; }
+        if (c < 0 || (pad && c > C_RT)) {
+            fprintf(stderr, "[INPUT] %s: unknown control \"%s%s\"\n", path, pad ? "pad." : "", name);
+            continue;
+        }
+        if (pad) {
+            int src = -1;
+            for (i = 0; i < P_COUNT; i++)
+                if (!strcmp(val, k_src[i])) { src = i; break; }
+            if (src < 0) {
+                fprintf(stderr, "[INPUT] %s: unknown controller button \"%s\"\n", path, val);
+                continue;
+            }
+            s_pad[c] = src;
+        } else {
+            int vk = key_code(val);
+            if (!vk) {
+                fprintf(stderr, "[INPUT] %s: unknown key \"%s\"\n", path, val);
+                continue;
+            }
+            s_key[c] = vk;
+        }
+        fprintf(stderr, "[INPUT] %s%s = %s\n", pad ? "pad." : "", name, val);
+        n++;
+    }
+    fclose(f);
+    fprintf(stderr, "[INPUT] %s: %d binding(s)\n", path, n);
+    fflush(stderr);
+}
 
 /* ======================================================================== */
 #if defined(_WIN32)
@@ -87,41 +216,47 @@ static SHORT axis_from_keys(int negative, int positive)
 static void keyboard_state(XBOX_INPUT_STATE *pState)
 {
     static DWORD packet;
+    static const WORD dig[8] = {
+        XBOX_GAMEPAD_DPAD_UP, XBOX_GAMEPAD_DPAD_DOWN, XBOX_GAMEPAD_DPAD_LEFT,
+        XBOX_GAMEPAD_DPAD_RIGHT, XBOX_GAMEPAD_START, XBOX_GAMEPAD_BACK,
+        XBOX_GAMEPAD_LEFT_THUMB, XBOX_GAMEPAD_RIGHT_THUMB };
+    static const int ana[8] = {
+        XBOX_BUTTON_A, XBOX_BUTTON_B, XBOX_BUTTON_X, XBOX_BUTTON_Y,
+        XBOX_BUTTON_BLACK, XBOX_BUTTON_WHITE, XBOX_BUTTON_LTRIGGER, XBOX_BUTTON_RTRIGGER };
     WORD b = 0;
+    int c;
 
+    bindings_load();
     memset(pState, 0, sizeof(*pState));
-
-    if (key_down(VK_UP))     b |= XBOX_GAMEPAD_DPAD_UP;
-    if (key_down(VK_DOWN))   b |= XBOX_GAMEPAD_DPAD_DOWN;
-    if (key_down(VK_LEFT))   b |= XBOX_GAMEPAD_DPAD_LEFT;
-    if (key_down(VK_RIGHT))  b |= XBOX_GAMEPAD_DPAD_RIGHT;
-    if (key_down(VK_RETURN)) b |= XBOX_GAMEPAD_START;
-    if (key_down(VK_BACK))   b |= XBOX_GAMEPAD_BACK;
-    if (key_down(VK_SHIFT))  b |= XBOX_GAMEPAD_LEFT_THUMB;
-    if (key_down(VK_CONTROL))b |= XBOX_GAMEPAD_RIGHT_THUMB;
+    for (c = C_UP; c <= C_RS; c++)
+        if (key_down(s_key[c])) b |= dig[c];
     pState->Gamepad.wButtons = b;
-
     /* Analog on the console, so a key is 255 rather than a flag -- a title
      * that reads these as a pressure never sees a press if they are 1. */
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A]        = key_down('Z') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B]        = key_down('X') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X]        = key_down('A') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y]        = key_down('S') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE]    = key_down('Q') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK]    = key_down('E') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = key_down('1') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = key_down('3') ? 255 : 0;
-
-    /* W/A/S/D would collide with the face buttons above, so the left thumb
-     * shares the arrow keys' row on the numeric pad instead. */
-    pState->Gamepad.sThumbLX = axis_from_keys(VK_NUMPAD4, VK_NUMPAD6);
-    pState->Gamepad.sThumbLY = axis_from_keys(VK_NUMPAD2, VK_NUMPAD8);
-    pState->Gamepad.sThumbRX = axis_from_keys('J', 'L');
-    pState->Gamepad.sThumbRY = axis_from_keys('K', 'I');
+    for (c = C_A; c <= C_RT; c++)
+        pState->Gamepad.bAnalogButtons[ana[c - C_A]] = key_down(s_key[c]) ? 255 : 0;
+    pState->Gamepad.sThumbLX = axis_from_keys(s_key[C_LSL], s_key[C_LSR]);
+    pState->Gamepad.sThumbLY = axis_from_keys(s_key[C_LSD], s_key[C_LSU]);
+    pState->Gamepad.sThumbRX = axis_from_keys(s_key[C_RSL], s_key[C_RSR]);
+    pState->Gamepad.sThumbRY = axis_from_keys(s_key[C_RSD], s_key[C_RSU]);
 
     /* The title's input layer looks for button edges, so the packet number
      * has to move whenever the state does or a press is never noticed. */
     pState->dwPacketNumber = ++packet;
+}
+
+/* A controller source (k_src) as 0..255. */
+static int pad_src(const XINPUT_GAMEPAD *g, int src)
+{
+    static const WORD bit[P_LT] = {
+        XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_LEFT,
+        XINPUT_GAMEPAD_DPAD_RIGHT, XINPUT_GAMEPAD_START, XINPUT_GAMEPAD_BACK,
+        XINPUT_GAMEPAD_LEFT_THUMB, XINPUT_GAMEPAD_RIGHT_THUMB, XINPUT_GAMEPAD_A,
+        XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y,
+        XINPUT_GAMEPAD_LEFT_SHOULDER, XINPUT_GAMEPAD_RIGHT_SHOULDER };
+    if (src == P_LT) return g->bLeftTrigger;
+    if (src == P_RT) return g->bRightTrigger;
+    return (g->wButtons & bit[src]) ? 255 : 0;
 }
 
 void xbox_InputInit(void)
@@ -141,7 +276,17 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
 
-    result = XInputGetState(dwPort, &xi_state);
+    /* RECOMP_NO_HOST_PAD=1: ignore the machine's real controllers (scripted
+     * test runs, so a pad in someone's hands does not steer them; the
+     * scripted presses and the keyboard still work). */
+    {
+        static int no_pad = -1;
+        if (no_pad < 0) {
+            const char *v = getenv("RECOMP_NO_HOST_PAD");
+            no_pad = v && *v && *v != '0';
+        }
+        result = no_pad ? ERROR_DEVICE_NOT_CONNECTED : XInputGetState(dwPort, &xi_state);
+    }
     if (result != ERROR_SUCCESS) {
         g_controller_connected[dwPort] = FALSE;
         if (dwPort == 0 && keyboard_enabled()) {
@@ -156,22 +301,25 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 
     memset(pState, 0, sizeof(XBOX_INPUT_STATE));
     pState->dwPacketNumber = xi_state.dwPacketNumber;
-    pState->Gamepad.wButtons = xi_state.Gamepad.wButtons & 0x00FF;
-
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_A) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_B) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_X) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_Y) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = xi_state.Gamepad.bLeftTrigger;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = xi_state.Gamepad.bRightTrigger;
+    /* Through the bindings (keys.ini pad.<control>); by default the
+     * usual layout: shoulders = black (LB) / white (RB). */
+    bindings_load();
+    {
+        static const WORD dig[8] = {
+            XBOX_GAMEPAD_DPAD_UP, XBOX_GAMEPAD_DPAD_DOWN, XBOX_GAMEPAD_DPAD_LEFT,
+            XBOX_GAMEPAD_DPAD_RIGHT, XBOX_GAMEPAD_START, XBOX_GAMEPAD_BACK,
+            XBOX_GAMEPAD_LEFT_THUMB, XBOX_GAMEPAD_RIGHT_THUMB };
+        static const int ana[8] = {
+            XBOX_BUTTON_A, XBOX_BUTTON_B, XBOX_BUTTON_X, XBOX_BUTTON_Y,
+            XBOX_BUTTON_BLACK, XBOX_BUTTON_WHITE, XBOX_BUTTON_LTRIGGER, XBOX_BUTTON_RTRIGGER };
+        WORD w = 0;
+        int c;
+        for (c = C_UP; c <= C_RS; c++)
+            if (pad_src(&xi_state.Gamepad, s_pad[c]) > 30) w |= dig[c];
+        pState->Gamepad.wButtons = w;
+        for (c = C_A; c <= C_RT; c++)
+            pState->Gamepad.bAnalogButtons[ana[c - C_A]] = (BYTE)pad_src(&xi_state.Gamepad, s_pad[c]);
+    }
 
     pState->Gamepad.sThumbLX = xi_state.Gamepad.sThumbLX;
     pState->Gamepad.sThumbLY = xi_state.Gamepad.sThumbLY;
@@ -216,6 +364,12 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
 
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
         return ERROR_DEVICE_NOT_CONNECTED;
+    {
+        /* RECOMP_NO_HOST_PAD (scripted runs): no rumble on someone's pad. */
+        const char *v = getenv("RECOMP_NO_HOST_PAD");
+        if (v && *v && *v != '0')
+            return ERROR_DEVICE_NOT_CONNECTED;
+    }
 
     xi_vib.wLeftMotorSpeed = pVibration->wLeftMotorSpeed;
     xi_vib.wRightMotorSpeed = pVibration->wRightMotorSpeed;
@@ -257,18 +411,82 @@ static SDL_GameController *g_pads[XBOX_MAX_CONTROLLERS];
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS];
 static DWORD g_packet[XBOX_MAX_CONTROLLERS];
 
-/* Open up to XBOX_MAX_CONTROLLERS attached game controllers. */
+/* RECOMP_KEYBOARD=1: the keyboard as player 1, merged over any pad. Same map
+ * as the Windows backend; keys come from the framebuffer window as VK codes. */
+extern int xbox_FramebufferKeyDown(int vk);
+
+static int keyboard_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECOMP_KEYBOARD");
+        on = (v && *v && *v != '0') ? 1 : 0;
+    }
+    return on;
+}
+
+static SHORT kb_axis(int neg, int pos)
+{
+    int v = 0;
+    if (xbox_FramebufferKeyDown(neg)) v -= 32767;
+    if (xbox_FramebufferKeyDown(pos)) v += 32767;
+    return (SHORT)v;
+}
+
+/* OR the keyboard into *pState. */
+static void keyboard_merge(XBOX_INPUT_STATE *pState)
+{
+    static const WORD dig[8] = {
+        XBOX_GAMEPAD_DPAD_UP, XBOX_GAMEPAD_DPAD_DOWN, XBOX_GAMEPAD_DPAD_LEFT,
+        XBOX_GAMEPAD_DPAD_RIGHT, XBOX_GAMEPAD_START, XBOX_GAMEPAD_BACK,
+        XBOX_GAMEPAD_LEFT_THUMB, XBOX_GAMEPAD_RIGHT_THUMB };
+    static const int ana[8] = {
+        XBOX_BUTTON_A, XBOX_BUTTON_B, XBOX_BUTTON_X, XBOX_BUTTON_Y,
+        XBOX_BUTTON_BLACK, XBOX_BUTTON_WHITE, XBOX_BUTTON_LTRIGGER, XBOX_BUTTON_RTRIGGER };
+    WORD b = 0;
+    int c;
+
+    bindings_load();
+    for (c = C_UP; c <= C_RS; c++)
+        if (xbox_FramebufferKeyDown(s_key[c])) b |= dig[c];
+    pState->Gamepad.wButtons |= b;
+    for (c = C_A; c <= C_RT; c++)
+        if (xbox_FramebufferKeyDown(s_key[c]))
+            pState->Gamepad.bAnalogButtons[ana[c - C_A]] = 255;
+    if (!pState->Gamepad.sThumbLX) pState->Gamepad.sThumbLX = kb_axis(s_key[C_LSL], s_key[C_LSR]);
+    if (!pState->Gamepad.sThumbLY) pState->Gamepad.sThumbLY = kb_axis(s_key[C_LSD], s_key[C_LSU]);
+    if (!pState->Gamepad.sThumbRX) pState->Gamepad.sThumbRX = kb_axis(s_key[C_RSL], s_key[C_RSR]);
+    if (!pState->Gamepad.sThumbRY) pState->Gamepad.sThumbRY = kb_axis(s_key[C_RSD], s_key[C_RSU]);
+}
+
+/* Open attached game controllers into free slots (up to
+ * XBOX_MAX_CONTROLLERS); a pad that went away frees its slot. */
 static void open_controllers(void)
 {
-    int slot = 0;
-    for (int i = 0; i < SDL_NumJoysticks() && slot < XBOX_MAX_CONTROLLERS; i++) {
+    for (int slot = 0; slot < XBOX_MAX_CONTROLLERS; slot++)
+        if (g_pads[slot] && !SDL_GameControllerGetAttached(g_pads[slot])) {
+            SDL_GameControllerClose(g_pads[slot]);
+            g_pads[slot] = NULL;
+            g_controller_connected[slot] = FALSE;
+        }
+    for (int i = 0; i < SDL_NumJoysticks(); i++) {
+        SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(i);
+        int slot, open = 0;
         if (!SDL_IsGameController(i))
             continue;
-        if (!g_pads[slot]) {
-            g_pads[slot] = SDL_GameControllerOpen(i);
-            g_controller_connected[slot] = (g_pads[slot] != NULL);
-        }
-        slot++;
+        for (slot = 0; slot < XBOX_MAX_CONTROLLERS; slot++)
+            if (g_pads[slot] && SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(g_pads[slot])) == id)
+                open = 1;
+        if (open)
+            continue;
+        for (slot = 0; slot < XBOX_MAX_CONTROLLERS && g_pads[slot]; slot++)
+            ;
+        if (slot == XBOX_MAX_CONTROLLERS)
+            break;
+        g_pads[slot] = SDL_GameControllerOpen(i);
+        g_controller_connected[slot] = (g_pads[slot] != NULL);
+        if (g_pads[slot])
+            fprintf(stderr, "[INPUT] controller %d: %s\n", slot, SDL_GameControllerName(g_pads[slot]));
     }
 }
 
@@ -279,14 +497,47 @@ void xbox_InputInit(void)
     open_controllers();
 }
 
+/* Set up on first use (nothing else calls xbox_InputInit on POSIX), then
+ * look for newly attached pads once a second while a slot is free. */
+static void input_poll_devices(void)
+{
+    static int inited;
+    static Uint32 next_scan;
+    int slot;
+    if (!inited) {
+        inited = 1;
+        xbox_InputInit();
+        next_scan = SDL_GetTicks() + 1000;
+        return;
+    }
+    if ((Sint32)(SDL_GetTicks() - next_scan) < 0)
+        return;
+    next_scan = SDL_GetTicks() + 1000;
+    for (slot = 0; slot < XBOX_MAX_CONTROLLERS; slot++)
+        if (!g_pads[slot] || !SDL_GameControllerGetAttached(g_pads[slot])) {
+            SDL_GameControllerUpdate();     /* lets SDL notice new devices */
+            open_controllers();
+            break;
+        }
+}
+
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
+    if (dwPort == 0)
+        input_poll_devices();
 
     SDL_GameController *c = g_pads[dwPort];
     if (!c || !SDL_GameControllerGetAttached(c)) {
         g_controller_connected[dwPort] = FALSE;
+        if (dwPort == 0 && keyboard_enabled()) {
+            static DWORD kb_packet;
+            memset(pState, 0, sizeof(*pState));
+            keyboard_merge(pState);
+            pState->dwPacketNumber = ++kb_packet;   /* must move for edges */
+            return ERROR_SUCCESS;
+        }
         return ERROR_DEVICE_NOT_CONNECTED;
     }
 
@@ -335,6 +586,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     pState->Gamepad.sThumbRY =
         (SHORT)(-1 - SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTY));
 
+    if (dwPort == 0 && keyboard_enabled())
+        keyboard_merge(pState);
     return ERROR_SUCCESS;
 }
 

@@ -40,6 +40,7 @@ int  xbox_OhciOwnsAddress(uint32_t xbox_va);
 /* Service a trapped access. Returns 1 if the faulting instruction was decoded
  * and stepped over. `ctx` is a PCONTEXT; void * keeps windows.h out of here. */
 int  xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va);
+int  xbox_OhciMmioAccess(uint32_t xbox_va, int is_write, uint64_t *val, int size);
 
 /* Report counts at exit, so a run says whether the driver ever looked. */
 void xbox_OhciReport(void);

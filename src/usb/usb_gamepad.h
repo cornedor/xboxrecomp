@@ -41,6 +41,11 @@ int usb_gamepad_report(int pad, uint8_t *out, int max);
 uint8_t usb_gamepad_address(int pad);
 int usb_gamepad_configured(int pad);
 
+/* Press buttons from inside the process: one RECOMP_PAD_LIVE line
+ * ("a", "right:120", "p2-start"), scheduled after whatever is queued. Single
+ * producer thread. Returns 0 if the queue (32 lines) is full. */
+int xbox_PadInject(const char *line);
+
 /* Up to four pads, one per Xbox controller port. Pad n is driven by host
  * XInput pad n and by pad-script steps prefixed "p<n+1>-". */
 #define USB_GAMEPAD_MAX 4

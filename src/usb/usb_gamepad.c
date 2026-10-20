@@ -442,6 +442,55 @@ static void pad_script_compact(unsigned long t)
     s_script_len = n;
 }
 
+/* Schedule one live line -- <button>[+<button>...][:<hold ms>], optionally
+ * "p2-" etc. -- at t, after whatever that pad already has queued. */
+static void pad_live_line(const char *pending, unsigned long t)
+{
+    /* Several lines in one read go one after another, with a 200 ms release
+     * between: a title polling its pad a few times a second would otherwise
+     * see "down" and "a" in the same report, which is a different input
+     * from "down, then a". Serialised per pad: pad 2's throttle must not
+     * wait out pad 1's -- split-screen players press at the same time. */
+    static unsigned long next_free[USB_GAMEPAD_MAX];
+    char line[560];
+    int pd = (pending[0] == 'p' || pending[0] == 'P')
+             && pending[1] >= '1' && pending[1] <= '4'
+             && pending[2] == '-' ? pending[1] - '1' : 0;
+    unsigned long at = t > next_free[pd] ? t : next_free[pd];
+    snprintf(line, sizeof line, "%lu:%s", at, pending);
+    if (s_script_len >= PAD_SCRIPT_MAX - 1)
+        pad_script_compact(t);
+    pad_script_parse(line);
+    if (s_script_len > 0)
+        next_free[pd] = at + s_script[s_script_len - 1].hold_ms + 200;
+    fprintf(stderr, "  PAD: live \"%s\" at t=%lu ms\n", pending, at);
+    fflush(stderr);
+}
+
+/* xbox_PadInject: the same lines from inside the process (a host thread that
+ * drives the menus by the title's own state), without the file. One producer
+ * thread; the pad poll drains it. */
+#define PAD_INJECT_SLOTS 32
+static char s_inject[PAD_INJECT_SLOTS][64];
+static volatile long s_inject_w, s_inject_r;
+
+#if defined(_MSC_VER)
+#define PAD_BARRIER() MemoryBarrier()
+#else
+#define PAD_BARRIER() __sync_synchronize()
+#endif
+
+int xbox_PadInject(const char *line)
+{
+    long w = s_inject_w;
+    if (!line || !*line || w - s_inject_r >= PAD_INJECT_SLOTS)
+        return 0;
+    snprintf(s_inject[w % PAD_INJECT_SLOTS], sizeof s_inject[0], "%s", line);
+    PAD_BARRIER();
+    s_inject_w = w + 1;
+    return 1;
+}
+
 /* Read whatever has been appended to RECOMP_PAD_LIVE since last time, and
  * schedule each complete line at t. Polled at most every 50 ms. */
 static void pad_live_poll(unsigned long t)
@@ -452,10 +501,14 @@ static void pad_live_poll(unsigned long t)
     static unsigned long last_poll;
     static char pending[512];
     static size_t npending;
-    static unsigned long next_free[USB_GAMEPAD_MAX];
     FILE *f;
     int c;
 
+    while (s_inject_r != s_inject_w) {
+        PAD_BARRIER();
+        pad_live_line(s_inject[s_inject_r % PAD_INJECT_SLOTS], t);
+        s_inject_r++;
+    }
     if (!checked) {
         checked = 1;
         path = getenv("RECOMP_PAD_LIVE");
@@ -478,26 +531,8 @@ static void pad_live_poll(unsigned long t)
         consumed++;
         if (c == '\n' || c == '\r') {
             if (npending) {
-                char line[560];
-                /* Several lines in one read go one after another, with a
-                 * 200 ms release between: a title polling its pad a few times
-                 * a second would otherwise see "down" and "a" in the same
-                 * report, which is a different input from "down, then a". */
-                /* Serialised per pad: pad 2's throttle must not wait out
-                 * pad 1's -- split-screen players press at the same time. */
-                int pd = (pending[0] == 'p' || pending[0] == 'P')
-                         && pending[1] >= '1' && pending[1] <= '4'
-                         && pending[2] == '-' ? pending[1] - '1' : 0;
-                unsigned long at = t > next_free[pd] ? t : next_free[pd];
                 pending[npending] = 0;
-                snprintf(line, sizeof line, "%lu:%s", at, pending);
-                if (s_script_len >= PAD_SCRIPT_MAX - 1)
-                    pad_script_compact(t);
-                pad_script_parse(line);
-                if (s_script_len > 0)
-                    next_free[pd] = at + s_script[s_script_len - 1].hold_ms + 200;
-                fprintf(stderr, "  PAD: live \"%s\" at t=%lu ms\n", pending, at);
-                fflush(stderr);
+                pad_live_line(pending, t);
                 npending = 0;
             }
         } else if (npending < sizeof pending - 1) {
