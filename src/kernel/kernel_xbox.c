@@ -11,6 +11,8 @@
 
 #include "kernel.h"
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 /* ============================================================================
  * Exported Data Objects
@@ -125,11 +127,63 @@ NTSTATUS __stdcall xbox_XeUnloadSection(PXBE_SECTION_HEADER Section)
  *   - DVD Region: Region 1 (North America)
  * ============================================================================ */
 
+/* The console's time zone, from the host's (Windows GetTimeZoneInformation):
+ * EEPROM holds the bias (UTC = local + bias, minutes), the standard and
+ * daylight biases and the dates DST starts and ends (month, week-of-month
+ * "day", day of week, hour). Without it XAPI's local time was UTC -- SSX 3
+ * stamped saves two hours off in CEST. */
+typedef struct { uint8_t month, day, dow, hour; } XboxTzDate;
+static struct {
+    int32_t bias, std_bias, dlt_bias;
+    XboxTzDate std_date, dlt_date;
+    char std_name[4], dlt_name[4];
+} s_tz;
+
+static void tz_init(void)
+{
+    static int done;
+    if (done)
+        return;
+    done = 1;
+#ifdef _WIN32
+    {
+        TIME_ZONE_INFORMATION tzi;
+        int k;
+        memset(&tzi, 0, sizeof tzi);
+        GetTimeZoneInformation(&tzi);
+        s_tz.bias = tzi.Bias;
+        s_tz.std_bias = tzi.StandardBias;
+        s_tz.dlt_bias = tzi.DaylightBias;
+        s_tz.std_date.month = (uint8_t)tzi.StandardDate.wMonth;
+        s_tz.std_date.day = (uint8_t)tzi.StandardDate.wDay;
+        s_tz.std_date.dow = (uint8_t)tzi.StandardDate.wDayOfWeek;
+        s_tz.std_date.hour = (uint8_t)tzi.StandardDate.wHour;
+        s_tz.dlt_date.month = (uint8_t)tzi.DaylightDate.wMonth;
+        s_tz.dlt_date.day = (uint8_t)tzi.DaylightDate.wDay;
+        s_tz.dlt_date.dow = (uint8_t)tzi.DaylightDate.wDayOfWeek;
+        s_tz.dlt_date.hour = (uint8_t)tzi.DaylightDate.wHour;
+        /* Four characters each, from the first letters of the names. */
+        for (k = 0; k < 4; k++) {
+            s_tz.std_name[k] = (char)(tzi.StandardName[k] < 128 ? tzi.StandardName[k] : '?');
+            s_tz.dlt_name[k] = (char)(tzi.DaylightName[k] < 128 ? tzi.DaylightName[k] : '?');
+        }
+    }
+#endif
+}
+
 NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     ULONG ValueIndex, PULONG Type, PVOID Value, ULONG ValueLength, PULONG ResultLength)
 {
     if (!Value)
         return STATUS_INVALID_PARAMETER;
+    tz_init();
+    {
+        static int trace = -1;
+        if (trace < 0)
+            trace = getenv("RECOMP_NV_TRACE") != NULL;
+        if (trace)
+            fprintf(stderr, "  [NV] query index 0x%02X len %u\n", (unsigned)ValueIndex, (unsigned)ValueLength);
+    }
 
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_XBOX,
         "ExQueryNonVolatileSetting: index=0x%02X len=%u", ValueIndex, ValueLength);
@@ -194,13 +248,57 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         break;
 
     case XC_TIMEZONE_BIAS:
-        /* UTC-5 (Eastern Time) in minutes: -300 */
+    case XC_TZ_STD_BIAS:
+    case XC_TZ_DLT_BIAS:
         if (ValueLength >= sizeof(LONG)) {
-            *(PLONG)Value = -300;
+            *(PLONG)Value = ValueIndex == XC_TIMEZONE_BIAS ? s_tz.bias
+                          : ValueIndex == XC_TZ_STD_BIAS ? s_tz.std_bias : s_tz.dlt_bias;
             if (Type) *Type = 4;
             if (ResultLength) *ResultLength = sizeof(LONG);
         }
         break;
+
+    case XC_TZ_STD_NAME:
+    case XC_TZ_DLT_NAME:
+        if (ValueLength >= 4) {
+            memcpy(Value, ValueIndex == XC_TZ_STD_NAME ? s_tz.std_name : s_tz.dlt_name, 4);
+            if (Type) *Type = 3;                 /* REG_BINARY */
+            if (ResultLength) *ResultLength = 4;
+        }
+        break;
+
+    case XC_TZ_STD_DATE:
+    case XC_TZ_DLT_DATE:
+        if (ValueLength >= 4) {
+            memcpy(Value, ValueIndex == XC_TZ_STD_DATE ? &s_tz.std_date : &s_tz.dlt_date, 4);
+            if (Type) *Type = 4;
+            if (ResultLength) *ResultLength = 4;
+        }
+        break;
+
+    case XC_MAX_OS: {
+        /* The whole user-settings block (EEPROM 0x60..): checksum, bias,
+         * std/dlt names, 8 reserved, std/dlt dates, 8 reserved, std/dlt bias,
+         * language, video, audio, parental x3, online x4, misc, DVD region. */
+        uint8_t blk[0x5C];
+        memset(blk, 0, sizeof blk);
+        memcpy(blk + 0x04, &s_tz.bias, 4);
+        memcpy(blk + 0x08, s_tz.std_name, 4);
+        memcpy(blk + 0x0C, s_tz.dlt_name, 4);
+        memcpy(blk + 0x18, &s_tz.std_date, 4);
+        memcpy(blk + 0x1C, &s_tz.dlt_date, 4);
+        memcpy(blk + 0x28, &s_tz.std_bias, 4);
+        memcpy(blk + 0x2C, &s_tz.dlt_bias, 4);
+        { ULONG v = 1; memcpy(blk + 0x30, &v, 4); }                       /* English */
+        { ULONG v = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV; memcpy(blk + 0x34, &v, 4); }
+        { ULONG v = 1; memcpy(blk + 0x58, &v, 4); }                       /* DVD region 1 */
+        memcpy(Value, blk, ValueLength < sizeof blk ? ValueLength : sizeof blk);
+        if (ValueLength > sizeof blk)
+            memset((uint8_t *)Value + sizeof blk, 0, ValueLength - sizeof blk);
+        if (Type) *Type = 3;
+        if (ResultLength) *ResultLength = ValueLength < sizeof blk ? ValueLength : sizeof blk;
+        break;
+    }
 
     default:
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_XBOX,

@@ -824,7 +824,12 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     }
 
     int fd;
-    if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
+    struct stat host_st;
+    if (!(CreateOptions & XBOX_FILE_DIRECTORY_FILE) &&
+        stat(host_path, &host_st) == 0 && S_ISDIR(host_st.st_mode)) {
+        /* A title opening a partition device (a directory here) as a file. */
+        fd = open(host_path, O_RDONLY | O_DIRECTORY);
+    } else if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
         if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
             mkdir(host_path, 0755);   /* EEXIST is fine */
         fd = open(host_path, O_RDONLY | O_DIRECTORY);
@@ -835,6 +840,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     if (fd < 0) {
         int e = errno;
         XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile FAILED: %s (errno=%d)", host_path, e);
+        fprintf(stderr, "  [FILE] host open '%s' failed: %s\n", host_path, strerror(e));
         if (IoStatusBlock) {
             IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
             IoStatusBlock->Information = 0;

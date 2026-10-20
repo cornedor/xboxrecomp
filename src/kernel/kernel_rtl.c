@@ -532,6 +532,23 @@ VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
     }
 }
 
+/* For the kernel dispatcher (kernel_bridge.c): take a guest critical section
+ * only if that needs no waiting, and keep it held -- the bridge's own Enter
+ * then nests on it -- so an uncontended Enter can run without letting go of
+ * the guest CPU. xbox_cs_drop_hold undoes the extra hold afterwards. */
+int xbox_cs_try_hold(PRTL_CRITICAL_SECTION CriticalSection)
+{
+    CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
+    return cs && TryEnterCriticalSection(cs);
+}
+
+void xbox_cs_drop_hold(PRTL_CRITICAL_SECTION CriticalSection)
+{
+    CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
+    if (cs)
+        LeaveCriticalSection(cs);
+}
+
 VOID __stdcall xbox_RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
     /* Creating the shadow here is not required -- Enter does it -- but doing

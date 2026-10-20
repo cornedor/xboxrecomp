@@ -168,6 +168,7 @@ DWORD  GetCurrentProcessId(void);
 BOOL   SetThreadPriority(HANDLE h, int priority);
 int    GetThreadPriority(HANDLE h);
 VOID   SwitchToThread(void);
+#define YieldProcessor() sched_yield()
 DWORD  QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data);
 
 /* ---- Sleep ------------------------------------------------------------ */
@@ -228,6 +229,7 @@ unsigned int _clearfp(void);   /* clear pending FPU exception flags */
 
 /* MSVC stack alloca alias. <alloca.h> provides the underlying function. */
 #include <alloca.h>
+#include <sched.h>
 #define _alloca(n) alloca(n)
 
 /* ---- Win32 file API (POSIX-backed) ----------------------------------- */

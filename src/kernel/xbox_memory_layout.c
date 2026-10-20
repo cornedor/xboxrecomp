@@ -191,11 +191,11 @@ static const struct { uint32_t offset; uint32_t busy_mask; } NV2A_ACK[] = {
      *
      * Holding them at zero is correct rather than convenient: nothing here
      * ever raises a GPU interrupt, so "none pending" is the truth. */
-    { 0x000100, 0xFFFFFFFFu },  /* PMC_INTR_0    */
     { 0x001100, 0xFFFFFFFFu },  /* PBUS_INTR_0   */
     { 0x002100, 0xFFFFFFFFu },  /* PFIFO_INTR_0  */
     { 0x400100, 0xFFFFFFFFu },  /* PGRAPH_INTR   */
-    { 0x600100, 0xFFFFFFFFu },  /* PCRTC_INTR_0  */
+    /* PMC_INTR_0 and PCRTC_INTR_0 are not held at zero any more: the vblank
+     * tick raises them and nv2a_intr_thread emulates their acknowledge. */
 };
 
 /*
@@ -448,6 +448,23 @@ static void ac97_arm_write_trap(void)
 #define XBOX_MAX_DSP_ACK 8
 static uint32_t g_dsp_ack[XBOX_MAX_DSP_ACK];
 static int g_dsp_ack_count = 0;
+
+/* Register a command word at run time, for a title whose doorbell address
+ * can be computed from its own DirectSound objects (no fixed address, so no
+ * dependence on allocation order). Duplicates are ignored. Returns 0 or -1
+ * when the table is full. */
+int xbox_DspAckAdd(uint32_t va)
+{
+    int i;
+    for (i = 0; i < g_dsp_ack_count; i++)
+        if (g_dsp_ack[i] == va)
+            return 0;
+    if (g_dsp_ack_count >= XBOX_MAX_DSP_ACK)
+        return -1;
+    g_dsp_ack[g_dsp_ack_count++] = va;
+    fprintf(stderr, "  DSP ack: command word 0x%08X registered at run time\n", va);
+    return 0;
+}
 
 static void dsp_ack_init(void)
 {
@@ -785,8 +802,50 @@ static void frame_counters_tick(void)
     }
 }
 
+/* Asynchronous pushbuffer execution (RECOMP_NV2A_ACK_THREAD): the title no
+ * longer waits for each batch to be drawn, so "everything submitted is
+ * complete" stops being true and the fence must say how far execution really
+ * got. D3D puts that in the pushbuffer itself: BACK_END_WRITE_SEMAPHORE_RELEASE
+ * (0x1D70) carries the time value the GPU writes to the fence when it gets
+ * there, and PGRAPH keeps a copy at 0x400B10 that D3D compares against the
+ * fence (SSX 3 guest 0x00234870). The executor calls this as it executes the
+ * method; in that mode the mirror below stands down. */
+static int nv2a_async(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_NV2A_ACK_THREAD");
+        on = e && *e && *e != '0';
+    }
+    return on;
+}
+
+void xbox_Nv2aSemaphoreRelease(uint32_t value)
+{
+    if (!nv2a_async())
+        return;
+    if (g_nv2a_memory)
+        *(volatile uint32_t *)((char *)g_nv2a_memory + 0x400B10) = value;
+    for (int i = 0; i < g_fence_mirror_count; i++) {
+        uint32_t dev, get_ptr;
+
+        if (!fence_readable(g_fence_mirrors[i].device_ptr_va, 4))
+            continue;
+        dev = *(volatile uint32_t *)((uintptr_t)g_fence_mirrors[i].device_ptr_va
+                                     + g_memory_offset);
+        if (!fence_readable(dev + g_fence_mirrors[i].get_ptr_off, 4))
+            continue;
+        get_ptr = *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].get_ptr_off)
+                                         + g_memory_offset);
+        if (fence_readable(get_ptr, 4))
+            *(volatile uint32_t *)((uintptr_t)get_ptr + g_memory_offset) = value;
+    }
+}
+
 static void fence_mirrors_tick(void)
 {
+    if (nv2a_async())
+        return;             /* the executor's semaphore releases own the fence */
     for (int i = 0; i < g_fence_mirror_count; i++) {
         uint32_t dev, get_ptr;
 
@@ -871,6 +930,148 @@ static void framebuffer_probe_tick(void)
             sum != last_sum ? "CHANGED" : "same");
     last_sum = sum;
     fflush(stderr);
+}
+
+/* Time the executor has spent executing pushbuffer (performance-counter
+ * ticks), for per-frame accounting (fb_present.c RECOMP_FRAME_STATS). */
+static volatile LONGLONG g_exec_busy_ticks;
+double xbox_Nv2aExecBusyMs(void)
+{
+    static LARGE_INTEGER f;
+    if (!f.QuadPart)
+        QueryPerformanceFrequency(&f);
+    return (double)g_exec_busy_ticks * 1000.0 / (double)f.QuadPart;
+}
+
+/* KeTickCount's clock: milliseconds at 1 ms resolution, from the
+ * performance counter. GetTickCount() advances in ~15.6 ms steps whatever
+ * timeBeginPeriod says, and a title pacing itself by KeTickCount sees time
+ * stand still and then jump: SSX 3's frame timer (re-armed every 1000/60 ms
+ * from it) ran 40% of its intervals at ~33 ms and the rest at ~4. Starts at
+ * GetTickCount() so the value stays plausible. */
+uint32_t xbox_TickCountMs(void)
+{
+    static LARGE_INTEGER f, t0;
+    static uint32_t base;
+    LARGE_INTEGER now;
+    if (!f.QuadPart) {
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&t0);
+        base = GetTickCount();
+    }
+    QueryPerformanceCounter(&now);
+    return base + (uint32_t)((now.QuadPart - t0.QuadPart) * 1000 / f.QuadPart);
+}
+
+/* Windows 11 throttles a process whose window is not visible (minimised,
+ * covered, display off): it stops honouring timeBeginPeriod -- every 1 ms
+ * wait here becomes ~15.6 ms -- and may run its threads under EcoQoS on
+ * efficiency cores. Unattended, the game fell from 60 to 6-23 FPS some
+ * minutes in (when the display slept). A game opts out. */
+static void opt_out_of_power_throttling(void)
+{
+#if defined(_WIN32)
+    typedef struct { ULONG Version, ControlMask, StateMask; } PowerThrottlingState;
+    typedef BOOL (WINAPI *SetProcInfo)(HANDLE, int, LPVOID, DWORD);
+    SetProcInfo f = (SetProcInfo)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"),
+                                                        "SetProcessInformation");
+    if (f) {
+        PowerThrottlingState st;
+        st.Version = 1;
+        st.ControlMask = 0x1 | 0x4;   /* EXECUTION_SPEED | IGNORE_TIMER_RESOLUTION */
+        st.StateMask = 0;             /* ...both off: full speed, timers honoured */
+        if (!f(GetCurrentProcess(), 4 /* ProcessPowerThrottling */, &st, sizeof st)) {
+            st.ControlMask = 0x1;     /* older Windows: no timer-resolution flag */
+            f(GetCurrentProcess(), 4, &st, sizeof st);
+        }
+    }
+#endif
+}
+
+/* KeTickCount, every millisecond. It used to be written only by
+ * nv2a_ack_thread between pushbuffer passes, so it stood still for as long
+ * as the executor was busy drawing (several ms): SSX 3's frame timer, which
+ * re-arms itself from KeTickCount, then swung between ~3 and ~30 ms
+ * intervals around the right mean. */
+static DWORD WINAPI tick_count_thread(LPVOID unused)
+{
+    volatile uint32_t *tc = (volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
+                                                  + g_memory_offset);
+    (void)unused;
+    /* 1 ms sleeps: the kernel timer thread sets timeBeginPeriod(1). */
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+#endif
+    while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        *tc = xbox_TickCountMs();
+        Sleep(1);
+    }
+    return 0;
+}
+
+/* The register handshakes on their own thread.
+ *
+ * nv2a_ack_thread also executes the pushbuffer, and with the software
+ * rasteriser that takes most of a frame. D3D's kickoff sets the PFB flush bit
+ * (0x100410) and spins until it clears -- so with the clear living in that
+ * same loop, every kickoff waited for the whole previous batch to be drawn:
+ * the title and the GPU ran strictly in turn. SSX 3 measured 86% of its main
+ * thread in that spin at 5 FPS. Hardware clears the bit in microseconds and
+ * renders in parallel; this answers it at once. DMA_GET is still advanced
+ * only after execution, so D3D never reuses pushbuffer space the executor has
+ * not read.
+ *
+ * Opt-in (RECOMP_NV2A_ACK_THREAD=1) because it is not yet safe: once the
+ * title stops waiting for each batch to be drawn it can wrap the pushbuffer
+ * ring more than once between two executor passes, which the PUT/GET
+ * tracking below does not follow; SSX 3 then waits forever for GET in
+ * D3D's MakeSpace (guest 0x00234BE0 -> 0x00234850). Needs ring tracking that
+ * survives multiple wraps (or throttling PUT) before it can be the default. */
+static DWORD WINAPI nv2a_reg_ack_thread(LPVOID param)
+{
+    volatile uint32_t *regs = (volatile uint32_t *)param;
+    unsigned spin = 0;
+    LARGE_INTEGER freq, now, last;
+    LONGLONG idle_ticks;
+    const char *e = getenv("RECOMP_ACK_IDLE_US");
+    /* Spinning flat out kept a whole core busy for a handful of kickoffs a
+     * frame. Spin only while kickoffs are coming (within RECOMP_ACK_IDLE_US,
+     * default 2000 us, of the last one); after that sleep 1 ms at a time.
+     * The first kickoff after a quiet spell then waits up to ~1 ms (the
+     * clock runs at 1 ms resolution, timeBeginPeriod). 0 = always spin. */
+    QueryPerformanceFrequency(&freq);
+    idle_ticks = freq.QuadPart * (e ? atoi(e) : 2000) / 1000000;
+    QueryPerformanceCounter(&last);
+
+    while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        /* Only the PFB flush bit (NV2A_ACK[0]). The interrupt status
+         * registers after it are left to the slow loop: the vblank tick sets
+         * PCRTC_INTR_0 and then calls the title's ISR, and a thread clearing
+         * them in a tight loop wins that race -- the ISR reads "no vblank",
+         * never signals D3D's vblank event, and the title waits on it
+         * forever before its first frame. */
+        {
+            volatile uint32_t *r =
+                (volatile uint32_t *)((char *)regs + NV2A_ACK[0].offset);
+            if (*r & NV2A_ACK[0].busy_mask) {
+                *r &= ~NV2A_ACK[0].busy_mask;
+                QueryPerformanceCounter(&last);
+            }
+        }
+        for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
+            volatile uint32_t *r =
+                (volatile uint32_t *)((char *)regs + NV2A_IDLE[i].offset);
+            if ((*r & NV2A_IDLE[i].idle_mask) != NV2A_IDLE[i].idle_mask)
+                *r |= NV2A_IDLE[i].idle_mask;
+        }
+        if (++spin & 63)
+            YieldProcessor();
+        else {
+            QueryPerformanceCounter(&now);
+            Sleep(idle_ticks > 0 && now.QuadPart - last.QuadPart > idle_ticks ? 1 : 0);
+        }
+    }
+    return 0;
 }
 
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
@@ -1034,8 +1235,10 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             static uint32_t last_start = 0xFFFFFFFFu;
             uint32_t start = *(volatile uint32_t *)((char *)regs + 0x600800);
             if (start != last_start) {
+                extern int xbox_io_log(void);
                 last_start = start;
-                fprintf(stderr, "  [NV2A] PCRTC_START = 0x%08X\n", start);
+                if (xbox_io_log())
+                    fprintf(stderr, "  [NV2A] PCRTC_START = 0x%08X\n", start);
                 fflush(stderr);
             }
         }
@@ -1055,20 +1258,59 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * hardware whether or not anyone is asleep. GetTickCount() shares the
          * millisecond unit, so the rate matches. */
         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
-                               + g_memory_offset) = GetTickCount();
+                               + g_memory_offset) = xbox_TickCountMs();
 
         Sleep(0);  /* yield; the waiter is spinning on another core */
     }
     return 0;
 }
 
+/* Write-1-to-clear for the vblank interrupt, without trapping MMIO.
+ *
+ * The vblank tick (kernel_bridge.c) raises PCRTC_INTR_0 = 1 | NV2A_VBLANK_MARK
+ * and PMC_INTR_0 bit 24. D3D's vblank DPC (SSX 3 guest 0x0023B540) writes 1
+ * to PCRTC_INTR_0 -- clearing it on hardware -- and spins until PMC bit 24
+ * drops. In plain memory that write changes nothing, so the spin used to end
+ * only when the executor's register loop next zeroed every interrupt
+ * register: up to a whole software-rendered batch later on the default path
+ * (the timer thread, and every timer and DPC behind it, sat in that spin a
+ * third of the time), and never when the executor itself was waiting on a
+ * DPC (asynchronous mode deadlocked). The write of exactly 1 removes the
+ * marker bit, which is what this watches for. */
+#define NV2A_VBLANK_MARK 0x00000100u
+
+static DWORD WINAPI nv2a_intr_thread(LPVOID param)
+{
+    volatile uint32_t *pcrtc = (volatile uint32_t *)((char *)param + 0x600100);
+    volatile uint32_t *pmc   = (volatile uint32_t *)((char *)param + 0x000100);
+
+    while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        if (*pcrtc == 1u)                       /* acknowledged: marker gone */
+            *pcrtc = 0;
+        if (!(*pcrtc & 1u) && (*pmc & 0x01000000u))
+            *pmc &= ~0x01000000u;
+        {
+            extern void xbox_Nv2aSwmPulse(void);
+            xbox_Nv2aSwmPulse();
+        }
+        Sleep(1);
+    }
+    return 0;
+}
+
 static void xbox_Nv2aAckStart(void)
 {
+    CloseHandle(CreateThread(NULL, 0, nv2a_intr_thread, g_nv2a_memory, 0, NULL));
     dsp_ack_init();
     poke_init();
     g_nv2a_ack_stop = 0;
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
+    opt_out_of_power_throttling();
+    CloseHandle(CreateThread(NULL, 0, tick_count_thread, NULL, 0, NULL));
+    if (nv2a_async())
+        CloseHandle(CreateThread(NULL, 0, nv2a_reg_ack_thread,
+                                 g_nv2a_memory, 0, NULL));
     if (g_nv2a_ack_thread) {
         fprintf(stderr, "  NV2A busy-bit ack: %zu register(s) acknowledged\n",
                 sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]));
@@ -1790,7 +2032,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * this on Windows needs placeholder reservations (VirtualAlloc2). */
 #ifndef _WIN32
         g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
-        g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
+        /* The device apertures sit at base + 0xFD000000 and up, so base + 4 GB
+         * must stay inside the host address space. An OS-chosen reservation is
+         * placed at the top of it (0xFFFF........ on arm64 Linux) and every
+         * aperture then fails; ask for a low-ish address first. */
+        g_span_base = VirtualAlloc((LPVOID)(uintptr_t)0x100000000000ULL,
+                                   g_span_size, MEM_RESERVE, PAGE_NOACCESS);
+        if (!g_span_base)
+            g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
         if (g_span_base) {
             VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
             g_memory_base = MapViewOfFileEx(g_mapping_handle,
