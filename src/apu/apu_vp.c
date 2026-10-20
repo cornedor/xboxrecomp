@@ -140,10 +140,16 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
     set_notify_status(d, v, notifier, NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
 }
 
+/* Guest threads waiting for d->lock in voice_lock: the frame thread hands
+ * the lock over to them at its next frame boundary (apu_core.c). */
+volatile long g_apu_lock_waiters;
+
 static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
 {
     assert(v < MCPX_HW_MAX_VOICES);
+    qatomic_fetch_add(&g_apu_lock_waiters, 1);
     qemu_mutex_lock(&d->lock);
+    qatomic_fetch_add(&g_apu_lock_waiters, -1);
 
     uint64_t mask = 1ULL << (v % 64);
     if (lock) {

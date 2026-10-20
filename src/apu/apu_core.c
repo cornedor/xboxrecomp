@@ -319,12 +319,15 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
     d->monitor.queued_bytes_low = 1024;
     d->monitor.queued_bytes_high = 3072;
 
-    /* Try XAudio2 first (lower latency) */
-    if (xa2_init()) {
-        fprintf(stderr, "[APU] Using XAudio2 audio backend\n");
-        return;
+    /* Try XAudio2 first (lower latency); RECOMP_AUDIO=waveout skips it. */
+    {
+        const char *ab = getenv("RECOMP_AUDIO");
+        if (!(ab && !strcmp(ab, "waveout")) && xa2_init()) {
+            fprintf(stderr, "[APU] Using XAudio2 audio backend\n");
+            return;
+        }
     }
-    fprintf(stderr, "[APU] XAudio2 unavailable, falling back to waveOut\n");
+    fprintf(stderr, "[APU] XAudio2 unavailable or not wanted, using waveOut\n");
 
     WAVEFORMATEX wfx = { 0 };
     wfx.wFormatTag      = WAVE_FORMAT_PCM;
@@ -377,9 +380,71 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
             g_waveout.frames_written);
 }
 
+/* Set by se_frame around its monitor call: monitor.frame_buf then already
+ * holds the voice processor's 256 samples (8 VP frames of 32, written by
+ * mcpx_apu_dsp_frame) and must be kept, not cleared. */
+static int g_vp_frame;
+
+/* RECOMP_APU_LEVEL=1: once a second, the peak level of what was submitted
+ * and how much of it came from the voice processor. */
+static void apu_level_note(const int16_t *buf, int n, int from_vp)
+{
+    static int on = -1;
+    static int peak, vp_peak, bufs, vp_bufs;
+    static int64_t last;
+    int i, p = 0;
+    if (on < 0)
+        on = getenv("RECOMP_APU_LEVEL") != NULL;
+    if (!on)
+        return;
+    for (i = 0; i < n * 2; i++) {
+        int v = buf[i] < 0 ? -buf[i] : buf[i];
+        if (v > p) p = v;
+    }
+    if (p > peak) peak = p;
+    bufs++;
+    if (from_vp) { vp_bufs++; if (p > vp_peak) vp_peak = p; }
+    if (qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - last >= 1000) {
+        last = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+        int under, drops, minq, waits, refills;
+        xa2_take_stats(&under, &drops, &minq, &waits, &refills);
+        fprintf(stderr, "[APU-LEVEL] peak %d (vp peak %d) | buffers %d (vp %d) | underruns %d drops %d"
+                " waits %d refills %d min queued %d\n", peak, vp_peak, bufs, vp_bufs, under, drops,
+                waits, refills, minq);
+        peak = vp_peak = bufs = vp_bufs = 0;
+    }
+}
+
 void mcpx_apu_monitor_frame(MCPXAPUState *d)
 {
     if ((d->ep_frame_div + 1) % 8) {
+        return;
+    }
+
+    /* XAudio2, voice-processor frame: the guest's own mix is already in
+     * frame_buf. Clearing it here (as the path below does) silenced every
+     * title that drives the APU directly -- SSX 3's statically linked
+     * DirectSound -- while the software mixer and test tone still played.
+     * Add the software mixer on top and submit exactly these 256 samples. */
+    if (xa2_is_active() && g_vp_frame) {
+        if (g_test_tone.active && !g_audio_muted) {
+            for (int i = 0; i < 256; i++) {
+                int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
+                d->monitor.frame_buf[i][0] = s;
+                d->monitor.frame_buf[i][1] = s;
+                g_test_tone.phase += g_test_tone.phase_inc;
+                if (g_test_tone.phase >= 2.0 * M_PI)
+                    g_test_tone.phase -= 2.0 * M_PI;
+            }
+        }
+        if (!g_audio_muted)
+            mixer_render(d->monitor.frame_buf, 256);
+        /* Measured before the mute: a muted test run still shows whether
+         * the title produced sound. */
+        apu_level_note(&d->monitor.frame_buf[0][0], 256, 1);
+        if (g_audio_muted)
+            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+        xa2_submit_samples(&d->monitor.frame_buf[0][0], 256);
         return;
     }
 
@@ -413,11 +478,47 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
             remaining -= chunk;
         }
 
+        apu_level_note(&xa2_tmp[0][0], buf_size, 0);
         xa2_submit_samples((const int16_t *)xa2_tmp, buf_size);
         return;
     }
 
     if (!g_waveout.initialized) return;
+
+    /* waveOut, voice-processor frame: the same fix as XAudio2 above -- keep
+     * the guest's 256 samples (plus the software mixer) instead of clearing
+     * them, and fill the 2048-sample waveOut buffer from successive frames,
+     * submitting it when full. */
+    if (g_vp_frame) {
+        static int16_t acc[WAVEOUT_BUF_SAMPLES][2];
+        static int acc_n;
+        if (!g_audio_muted)
+            mixer_render(d->monitor.frame_buf, 256);
+        apu_level_note(&d->monitor.frame_buf[0][0], 256, 1);
+        if (g_audio_muted)
+            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+        memcpy(acc[acc_n], d->monitor.frame_buf, 256 * 2 * sizeof(int16_t));
+        acc_n += 256;
+        if (acc_n < WAVEOUT_BUF_SAMPLES)
+            return;
+        acc_n = 0;
+        {
+            int vi = g_waveout.next_buf, wl = 0;
+            WAVEHDR *vh = &g_waveout.hdrs[vi];
+            while (!(vh->dwFlags & WHDR_DONE) && (vh->dwFlags & WHDR_INQUEUE)) {
+                qemu_mutex_unlock(&d->lock);
+                Sleep(1);
+                qemu_mutex_lock(&d->lock);
+                if (++wl > 50) break;
+            }
+            memcpy(g_waveout.bufs[vi], acc, sizeof acc);
+            vh->dwFlags &= ~WHDR_DONE;
+            waveOutWrite(g_waveout.hwo, vh, sizeof(WAVEHDR));
+            g_waveout.next_buf = (vi + 1) % WAVEOUT_NUM_BUFS;
+            g_waveout.frames_written++;
+        }
+        return;
+    }
 
     int idx = g_waveout.next_buf;
     WAVEHDR *hdr = &g_waveout.hdrs[idx];
@@ -483,10 +584,32 @@ static void throttle(MCPXAPUState *d)
 
     int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 
+    /* Resync only when far behind. The wait below is in whole milliseconds
+     * and Windows wakes on its timer tick, so being a few milliseconds late
+     * is the normal case; resetting the schedule whenever a wake came more
+     * than one 5.3 ms output frame late threw that time away every time,
+     * and the voice processor ran at ~85% of real time -- audible as gaps
+     * once its output reached the speakers. Catching up instead keeps the
+     * average at 48 kHz; the output queue absorbs the bursts. */
     if (d->next_frame_time_us == 0 ||
-        now_us - d->next_frame_time_us > EP_FRAME_US) {
+        now_us - d->next_frame_time_us > 12 * EP_FRAME_US) {
         d->next_frame_time_us = now_us;
     }
+#if defined(_WIN32)
+    {
+        static int period_set;
+        if (!period_set) {
+            period_set = 1;
+            timeBeginPeriod(1);        /* 1 ms waits, not the 15.6 ms tick */
+        }
+    }
+#endif
+
+    /* The sound card's clock, not just the system's: with the output queue
+     * filling up (10+ of its 12 buffers) this side is ahead -- take one
+     * frame's time longer, waiting below with the lock released. */
+    if (xa2_is_active() && xa2_queued() >= 10)
+        d->next_frame_time_us += EP_FRAME_US;
 
     while (!d->pause_requested) {
         now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
@@ -530,7 +653,9 @@ static void se_frame(MCPXAPUState *d)
 
     mcpx_apu_vp_frame(d, mixbins);
     mcpx_apu_dsp_frame(d, mixbins);
+    g_vp_frame = d->monitor.point != MCPX_APU_DEBUG_MON_VP;
     mcpx_apu_monitor_frame(d);
+    g_vp_frame = 0;
 
     d->ep_frame_div++;
 
@@ -544,6 +669,12 @@ static void se_frame(MCPXAPUState *d)
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+#if defined(_WIN32)
+    /* The audio clock: a wake that comes late is a gap at the speakers once
+     * the output queue's cushion is used up, and the game's own threads
+     * keep every core busy. */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#endif
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
@@ -605,6 +736,17 @@ static void *mcpx_apu_frame_thread(void *arg)
          * off every USB interrupt. */
         qemu_mutex_unlock(&d->lock);
         SwitchToThread();
+        {
+            /* Hand over, not just offer: a guest thread waiting in
+             * voice_lock (with the guest CPU held) did not always get in at
+             * this brief release -- waits of ~26 ms were seen. Yield until
+             * it has the lock, at most 2 ms. */
+            extern volatile long g_apu_lock_waiters;
+            int64_t until = qemu_clock_get_us(QEMU_CLOCK_REALTIME) + 2000;
+            while (qatomic_read(&g_apu_lock_waiters) > 0
+                   && qemu_clock_get_us(QEMU_CLOCK_REALTIME) < until)
+                SwitchToThread();
+        }
         qemu_mutex_lock(&d->lock);
     }
 
@@ -691,6 +833,14 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     mcpx_apu_monitor_init(d, &local_err);
     if (local_err) {
         warn_reportf_err(local_err, "mcpx_apu_monitor_init failed: ");
+    }
+
+    /* RECOMP_MUTE=1: play silence (scripted test runs, so they make no
+     * noise). Everything else runs as usual, timing included. */
+    {
+        const char *m = getenv("RECOMP_MUTE");
+        if (m && *m && *m != '0')
+            g_audio_muted = 1;
     }
 
     /* Start background frame thread */
