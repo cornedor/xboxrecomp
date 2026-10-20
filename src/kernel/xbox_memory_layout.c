@@ -1132,6 +1132,49 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             static uint32_t last_put;
             DWORD now_ms = GetTickCount();
             uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
+            if (nv2a_async()) {
+                /* Asynchronous: the GPU's own walk, GET -> PUT following
+                 * jumps (nv2a_pb_run), with GET reported where it stopped. */
+                extern uint32_t nv2a_pb_run(uint32_t, uint32_t, volatile uint32_t *);
+                static uint32_t get_va;
+                uint32_t put_va = XBOX_CONTIG_BASE | (put & 0x0FFFFFFFu);
+                volatile uint32_t *get =
+                    (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET);
+                static DWORD idle_since, last_wake;
+                if (!get_va)
+                    get_va = put_va;
+                else if (get_va != put_va) {
+                    LARGE_INTEGER b0, b1;
+                    QueryPerformanceCounter(&b0);
+                    get_va = nv2a_pb_run(get_va, put_va, get);
+                    QueryPerformanceCounter(&b1);
+                    g_exec_busy_ticks += b1.QuadPart - b0.QuadPart;
+                    idle_since = 0;
+                }
+                *get = get_va & 0x0FFFFFFFu;
+                /* Idle wake. D3D's blocking fence wait checks that the GPU is
+                 * far behind, then patches NO_OPERATION(5) in at the fence's
+                 * position and sleeps until that NOP's software method wakes
+                 * it. This executor is fast enough to run past the position
+                 * between the check and the patch; the NOP then never runs
+                 * and the title sleeps forever with everything executed
+                 * (seen on the map-select and rules screens). Idle at PUT
+                 * means every kicked fence has been reached, so the wake the
+                 * NOP would have delivered is due: deliver it. D3D clears the
+                 * event before each patch, so a wake nobody waits for does
+                 * not carry over. */
+                if (get_va == put_va) {
+                    DWORD now = GetTickCount();
+                    if (!idle_since)
+                        idle_since = now;
+                    if (now - idle_since >= 30 && now - last_wake >= 50) {
+                        extern void xbox_Nv2aIdleWake(void);
+                        last_wake = now;
+                        xbox_Nv2aIdleWake();
+                    }
+                }
+                last_put = put; last_put_ms = now_ms;
+            } else
             if (put != last_put || (now_ms - last_put_ms) > 2000) {
                 /* Survey the segment the title just submitted, once. */
                 {

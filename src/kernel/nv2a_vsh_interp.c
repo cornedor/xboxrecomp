@@ -39,6 +39,7 @@ static float    s_const[NV2A_VSH_CONSTANTS][4];
 static uint32_t s_load_slot, s_load_word, s_start_slot;
 static uint32_t s_const_load, s_const_word;
 static uint32_t s_cxt_write;
+static int      s_dirty = 1;           /* s_program changed since decode */
 
 static uint32_t field(const uint32_t *ins, int dw, int lo, int width)
 {
@@ -55,8 +56,10 @@ void nv2a_vsh_set_load_slot(uint32_t slot)
 
 void nv2a_vsh_program_word(uint32_t word)
 {
-    if (s_load_slot < NV2A_VSH_SLOTS)
+    if (s_load_slot < NV2A_VSH_SLOTS) {
         s_program[s_load_slot][s_load_word] = word;
+        s_dirty = 1;
+    }
     if (++s_load_word == 4) {
         s_load_word = 0;
         s_load_slot++;
@@ -65,6 +68,7 @@ void nv2a_vsh_program_word(uint32_t word)
 
 void nv2a_vsh_set_start_slot(uint32_t slot) { s_start_slot = slot; }
 void nv2a_vsh_set_cxt_write(uint32_t enable) { s_cxt_write = enable; }
+int  nv2a_vsh_cxt_write(void) { return s_cxt_write != 0; }
 
 void nv2a_vsh_set_constant_load(uint32_t index)
 {
@@ -72,8 +76,25 @@ void nv2a_vsh_set_constant_load(uint32_t index)
     s_const_word = 0;
 }
 
+/* RECOMP_C57_TRACE: every write that lands in constant 57 (and where from). */
+static void c57_trace(const char *src, uint32_t comp, uint32_t word)
+{
+    static int on = -1;
+    static long n;
+    union { uint32_t u; float f; } v;
+    if (on < 0)
+        on = getenv("RECOMP_C57_TRACE") != NULL;
+    if (!on || n > 4000)
+        return;
+    n++;
+    v.u = word;
+    fprintf(stderr, "[C57] %s .%c = %g\n", src, "xyzw"[comp & 3], v.f);
+}
+
 void nv2a_vsh_constant_word(uint32_t word)
 {
+    if (s_const_load == 57 && memcmp(&s_const[57][s_const_word], &word, 4))
+        c57_trace("upload", s_const_word, word);
     if (s_const_load < NV2A_VSH_CONSTANTS)
         memcpy(&s_const[s_const_load][s_const_word], &word, 4);
     if (++s_const_word == 4) {
@@ -90,8 +111,10 @@ void nv2a_vsh_set_constant(uint32_t index, const float v[4])
 
 void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4])
 {
-    if (slot < NV2A_VSH_SLOTS)
+    if (slot < NV2A_VSH_SLOTS) {
         memcpy(s_program[slot], words, sizeof s_program[slot]);
+        s_dirty = 1;
+    }
 }
 
 /* ---- disassembly (RECOMP_VSH_DUMP) --------------------------------------- */
@@ -159,6 +182,29 @@ static void dump_program(uint32_t start)
     fflush(stderr);
 }
 
+/* The running program to a file, raw words first (for traces). */
+void nv2a_vsh_dump_to(FILE *f)
+{
+    uint32_t s;
+    for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
+        const uint32_t *ins = s_program[s];
+        char a[40], bb[40], c[40];
+        dis_src(a, sizeof a, ins, 0);
+        dis_src(bb, sizeof bb, ins, 1);
+        dis_src(c, sizeof c, ins, 2);
+        fprintf(f, "  [VSH] %3u %08X %08X %08X %-4s %-4s A=%s B=%s C=%s  R%u mac%X ilu%X"
+                " out%s%u m%X%s%s\n", s, ins[1], ins[2], ins[3],
+                k_mac[field(ins, 1, 21, 4)], k_ilu[field(ins, 1, 25, 3)],
+                a, bb, c, field(ins, 3, 20, 4), field(ins, 3, 24, 4),
+                field(ins, 3, 16, 4), field(ins, 3, 11, 1) ? "o" : "c",
+                field(ins, 3, 3, 8), field(ins, 3, 12, 4),
+                field(ins, 3, 2, 1) ? " ilu" : " mac",
+                field(ins, 3, 0, 1) ? " FINAL" : "");
+        if (field(ins, 3, 0, 1))
+            break;
+    }
+}
+
 const float *nv2a_vsh_constant(uint32_t index)
 {
     return s_const[index < NV2A_VSH_CONSTANTS ? index : 0];
@@ -166,6 +212,8 @@ const float *nv2a_vsh_constant(uint32_t index)
 
 void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word)
 {
+    if (index == 57 && comp < 4 && memcmp(&s_const[57][comp], &word, 4))
+        c57_trace("method", comp, word);
     if (index < NV2A_VSH_CONSTANTS && comp < 4)
         memcpy(&s_const[index][comp], &word, 4);
 }
@@ -173,49 +221,6 @@ void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word)
 /* ---- execution ----------------------------------------------------------- */
 
 typedef struct { float v[4]; } vec4;
-
-static vec4 read_src(const uint32_t *ins, int which,
-                     const float in[NV2A_VSH_INPUTS][4],
-                     const vec4 *temp, const vec4 *opos, int a0)
-{
-    uint32_t neg, swz, mux, reg;
-    const float *s;
-    vec4 r;
-
-    if (which == 0) {
-        neg = field(ins, 1, 8, 1); swz = field(ins, 1, 0, 8);
-        mux = field(ins, 2, 26, 2); reg = field(ins, 2, 28, 4);
-    } else if (which == 1) {
-        neg = field(ins, 2, 25, 1); swz = field(ins, 2, 17, 8);
-        mux = field(ins, 2, 11, 2); reg = field(ins, 2, 13, 4);
-    } else {
-        neg = field(ins, 2, 10, 1); swz = field(ins, 2, 2, 8);
-        mux = field(ins, 3, 28, 2);
-        reg = (field(ins, 2, 0, 2) << 2) | field(ins, 3, 30, 2);
-    }
-
-    if (mux == 1)
-        s = (reg == 12) ? opos->v : (reg < 12 ? temp[reg].v : temp[0].v);
-    else if (mux == 2)
-        s = in[field(ins, 1, 9, 4)];
-    else {
-        int ci = (int)field(ins, 1, 13, 8);
-        if (field(ins, 3, 1, 1))
-            ci += a0;
-        if (ci < 0 || ci >= NV2A_VSH_CONSTANTS)
-            ci = 0;
-        s = s_const[ci];
-    }
-    r.v[0] = s[(swz >> 6) & 3];
-    r.v[1] = s[(swz >> 4) & 3];
-    r.v[2] = s[(swz >> 2) & 3];
-    r.v[3] = s[swz & 3];
-    if (neg) {
-        r.v[0] = -r.v[0]; r.v[1] = -r.v[1];
-        r.v[2] = -r.v[2]; r.v[3] = -r.v[3];
-    }
-    return r;
-}
 
 static void write_masked(float *dst, const vec4 *src, uint32_t mask)
 {
@@ -305,19 +310,184 @@ static vec4 run_ilu(uint32_t op, vec4 c)
     return r;
 }
 
+/* Content hash of the program that runs now (start slot to FINAL), and a dump
+ * of it -- for attributing bad output to a program. */
+uint32_t nv2a_vsh_program_hash(void)
+{
+    uint32_t h = 2166136261u, t;
+    int i;
+    for (t = s_start_slot; t < NV2A_VSH_SLOTS; t++) {
+        for (i = 0; i < 4; i++)
+            h = (h ^ s_program[t][i]) * 16777619u;
+        if (field(s_program[t], 3, 0, 1))
+            break;
+    }
+    return h;
+}
+
+void nv2a_vsh_dump_current(void)
+{
+    dump_program(s_start_slot);
+}
+
+/* Decoded program: the fields of every slot, extracted once per upload
+ * rather than per vertex and instruction. */
+typedef struct {
+    uint8_t mux, reg, in, neg, rel, swz[4];
+    uint16_t ci;
+} DecSrc;
+typedef struct {
+    DecSrc src[3];
+    uint8_t mac, ilu, mac_mask, ilu_mask, tdst, omask, oaddr;
+    uint8_t from_ilu, to_out, final;
+} DecIns;
+static DecIns s_dec[NV2A_VSH_SLOTS];
+static int s_exp_valid;           /* nv2a_vsh_export's copy: 0 stale, 1 ok, -1 no FINAL */
+
+/* Decode the program memory if it changed. Called before vertices are run on
+ * several threads, so they only ever read s_dec. */
+void nv2a_vsh_prepare(void)
+{
+    uint32_t t;
+    int w, k;
+    if (!s_dirty)
+        return;
+    for (t = 0; t < NV2A_VSH_SLOTS; t++) {
+        const uint32_t *ins = s_program[t];
+        DecIns *d = &s_dec[t];
+        for (w = 0; w < 3; w++) {
+            DecSrc *x = &d->src[w];
+            uint32_t neg, swz, mux, reg;
+            if (w == 0) {
+                neg = field(ins, 1, 8, 1); swz = field(ins, 1, 0, 8);
+                mux = field(ins, 2, 26, 2); reg = field(ins, 2, 28, 4);
+            } else if (w == 1) {
+                neg = field(ins, 2, 25, 1); swz = field(ins, 2, 17, 8);
+                mux = field(ins, 2, 11, 2); reg = field(ins, 2, 13, 4);
+            } else {
+                neg = field(ins, 2, 10, 1); swz = field(ins, 2, 2, 8);
+                mux = field(ins, 3, 28, 2);
+                reg = (field(ins, 2, 0, 2) << 2) | field(ins, 3, 30, 2);
+            }
+            x->mux = (uint8_t)mux;
+            x->reg = (uint8_t)(reg <= 12 ? reg : 0);  /* 12 = oPos, see run */
+            x->in = (uint8_t)field(ins, 1, 9, 4);
+            x->neg = (uint8_t)neg;
+            x->ci = (uint16_t)field(ins, 1, 13, 8);
+            x->rel = (uint8_t)field(ins, 3, 1, 1);
+            for (k = 0; k < 4; k++)
+                x->swz[k] = (uint8_t)((swz >> (6 - 2 * k)) & 3);
+        }
+        d->mac = (uint8_t)field(ins, 1, 21, 4);
+        d->ilu = (uint8_t)field(ins, 1, 25, 3);
+        d->mac_mask = (uint8_t)field(ins, 3, 24, 4);
+        d->ilu_mask = (uint8_t)field(ins, 3, 16, 4);
+        d->tdst = (uint8_t)field(ins, 3, 20, 4);
+        d->omask = (uint8_t)field(ins, 3, 12, 4);
+        d->oaddr = (uint8_t)field(ins, 3, 3, 8);
+        d->from_ilu = (uint8_t)field(ins, 3, 2, 1);
+        d->to_out = (uint8_t)field(ins, 3, 11, 1);
+        d->final = (uint8_t)field(ins, 3, 0, 1);
+    }
+    s_dirty = 0;
+    s_exp_valid = 0;
+}
+
+/* nv2a_vsh_export: rebuilt when the decoded program or start slot changes. */
+static uint32_t s_exp[NV2A_VSH_SLOTS][8];
+static Nv2aVshProgram s_exp_p;
+static uint32_t s_exp_start = 0xFFFFFFFFu;
+
+int nv2a_vsh_export(Nv2aVshProgram *p)
+{
+    uint32_t t, n = 0, k;
+    int w, valid = 0;
+    nv2a_vsh_prepare();             /* clears s_dirty: rebuilds below if it did */
+    if (!s_exp_valid || s_exp_start != s_start_slot) {
+        uint32_t h = 2166136261u;
+        memset(&s_exp_p, 0, sizeof s_exp_p);
+        memset(s_exp_p.in_slot, 0xFF, sizeof s_exp_p.in_slot);
+        for (t = s_start_slot; t < NV2A_VSH_SLOTS; t++) {
+            const DecIns *d = &s_dec[t];
+            uint32_t *o = s_exp[n++];
+            o[0] = d->mac | (uint32_t)d->ilu << 4 | (uint32_t)d->mac_mask << 8
+                 | (uint32_t)d->ilu_mask << 12 | (uint32_t)d->tdst << 16
+                 | (uint32_t)d->omask << 20 | (uint32_t)d->from_ilu << 24
+                 | (uint32_t)d->to_out << 25 | (uint32_t)d->final << 26;
+            o[1] = d->oaddr;
+            for (w = 0; w < 3; w++) {
+                const DecSrc *x = &d->src[w];
+                uint32_t slot = 0;
+                if (x->mux == 2) {
+                    if (s_exp_p.in_slot[x->in] == 0xFF)
+                        s_exp_p.in_slot[x->in] = (uint8_t)s_exp_p.nin++;
+                    slot = s_exp_p.in_slot[x->in];
+                }
+                o[2 + w] = x->mux | (uint32_t)x->reg << 2 | slot << 6 | (uint32_t)x->neg << 10
+                         | (uint32_t)x->rel << 11 | (uint32_t)x->swz[0] << 12
+                         | (uint32_t)x->swz[1] << 14 | (uint32_t)x->swz[2] << 16
+                         | (uint32_t)x->swz[3] << 18 | (uint32_t)x->ci << 20;
+            }
+            o[5] = o[6] = o[7] = 0;
+            for (k = 0; k < 5; k++)
+                h = (h ^ o[k]) * 16777619u;
+            if (d->final) {
+                valid = 1;
+                break;
+            }
+        }
+        s_exp_p.nins = n;
+        s_exp_p.ins = (const uint32_t (*)[8])s_exp;
+        s_exp_p.hash = h;
+        s_exp_valid = valid ? 1 : -1;
+        s_exp_start = s_start_slot;
+    }
+    s_exp_p.consts = (const float (*)[4])s_const;
+    *p = s_exp_p;
+    return s_exp_valid == 1;
+}
+
+static inline vec4 dec_src(const DecSrc *x, const float in[NV2A_VSH_INPUTS][4],
+                           const vec4 *reg, int a0)
+{
+    const float *s;
+    vec4 r;
+    if (x->mux == 1)
+        s = reg[x->reg].v;
+    else if (x->mux == 2)
+        s = in[x->in];
+    else {
+        int ci = x->ci + (x->rel ? a0 : 0);
+        if (ci < 0 || ci >= NV2A_VSH_CONSTANTS)
+            ci = 0;
+        s = s_const[ci];
+    }
+    r.v[0] = s[x->swz[0]]; r.v[1] = s[x->swz[1]];
+    r.v[2] = s[x->swz[2]]; r.v[3] = s[x->swz[3]];
+    if (x->neg) {
+        r.v[0] = -r.v[0]; r.v[1] = -r.v[1];
+        r.v[2] = -r.v[2]; r.v[3] = -r.v[3];
+    }
+    return r;
+}
+
 int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
 {
     static int dump = -1;
-    static uint32_t dumped[16];
+    static uint32_t dumped[128];
     static int ndumped;
-    vec4 temp[12], opos;
+    vec4 reg[13];                  /* R0..R11, and R12 = oPos */
     float outregs[13][4];
     int a0 = 0;
     uint32_t s;
 
-    if (dump < 0)
-        dump = getenv("RECOMP_VSH_DUMP") != NULL;
-    if (dump && ndumped < 16) {
+    if (dump < 0) {
+        /* RECOMP_VSH_DUMP=N: the first N distinct programs (1 or any
+         * non-number: 16). */
+        const char *e = getenv("RECOMP_VSH_DUMP");
+        dump = e ? (atoi(e) > 1 ? atoi(e) : 16) : 0;
+    }
+    if (dump && ndumped < dump && ndumped < (int)(sizeof dumped / sizeof dumped[0])) {
         /* By content: titles reload different programs into the same slot. */
         uint32_t h = 2166136261u, t;
         int i, seen = 0;
@@ -335,8 +505,8 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
         }
     }
 
-    memset(temp, 0, sizeof temp);
-    memset(&opos, 0, sizeof opos);
+    nv2a_vsh_prepare();
+    memset(reg, 0, sizeof reg);
     memset(outregs, 0, sizeof outregs);
     outregs[3][3] = outregs[4][3] = 1.0f;      /* colours default opaque */
     /* Unwritten texture coordinates are (0,0,0,1), as xemu initialises them:
@@ -345,50 +515,49 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
     outregs[9][3] = outregs[10][3] = outregs[11][3] = outregs[12][3] = 1.0f;
 
     for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
-        const uint32_t *ins = s_program[s];
-        uint32_t mac = field(ins, 1, 21, 4), ilu = field(ins, 1, 25, 3);
-        uint32_t mac_mask = field(ins, 3, 24, 4), ilu_mask = field(ins, 3, 16, 4);
-        uint32_t tdst = field(ins, 3, 20, 4);
-        uint32_t omask = field(ins, 3, 12, 4), oaddr = field(ins, 3, 3, 8);
-        vec4 a = read_src(ins, 0, in, temp, &opos, a0);
-        vec4 b = read_src(ins, 1, in, temp, &opos, a0);
-        vec4 c = read_src(ins, 2, in, temp, &opos, a0);
+        const DecIns *d = &s_dec[s];
+        vec4 a = dec_src(&d->src[0], in, reg, a0);
+        vec4 b = dec_src(&d->src[1], in, reg, a0);
+        vec4 c = dec_src(&d->src[2], in, reg, a0);
         vec4 mres = {{0, 0, 0, 0}}, ires = {{0, 0, 0, 0}};
 
-        if (mac)
-            mres = run_mac(mac, a, b, c, &a0);
-        if (ilu)
-            ires = run_ilu(ilu, c);
+        if (d->mac)
+            mres = run_mac(d->mac, a, b, c, &a0);
+        if (d->ilu)
+            ires = run_ilu(d->ilu, c);
 
-        if (mac && mac != 13 && mac_mask) {
-            float *d = tdst == 12 ? opos.v : (tdst < 12 ? temp[tdst].v : NULL);
-            if (d) write_masked(d, &mres, mac_mask);
-        }
-        if (ilu && ilu_mask) {
+        if (d->mac && d->mac != 13 && d->mac_mask && d->tdst <= 12)
+            write_masked(reg[d->tdst].v, &mres, d->mac_mask);
+        if (d->ilu && d->ilu_mask) {
             /* Paired with any MAC op, the ILU can only write R1 -- even when
              * the MAC half writes no temp at all. The D3D epilogue is exactly
              * that: `mul o[0].xyz` beside `rcc R1.x`, then `mad` with R1.x.
              * Sending the rcc to the temp field (R7 there) left R1.x at 0 and
              * put every vertex of every 3D batch at c[59]. */
-            uint32_t it = mac ? 1u : tdst;
-            float *d = it == 12 ? opos.v : (it < 12 ? temp[it].v : NULL);
-            if (d) write_masked(d, &ires, ilu_mask);
+            uint32_t it = d->mac ? 1u : d->tdst;
+            if (it <= 12)
+                write_masked(reg[it].v, &ires, d->ilu_mask);
         }
-        if (omask) {
-            const vec4 *src = field(ins, 3, 2, 1) ? &ires : &mres;
-            if (!field(ins, 3, 11, 1)) {                  /* to c[] */
-                if (s_cxt_write && oaddr < NV2A_VSH_CONSTANTS)
-                    write_masked(s_const[oaddr], src, omask);
-            } else if (oaddr == 0) {
-                write_masked(opos.v, src, omask);
-            } else if (oaddr < 13) {
-                write_masked(outregs[oaddr], src, omask);
+        if (d->omask) {
+            const vec4 *src = d->from_ilu ? &ires : &mres;
+            if (!d->to_out) {                             /* to c[] */
+                if (s_cxt_write && d->oaddr < NV2A_VSH_CONSTANTS)
+                    write_masked(s_const[d->oaddr], src, d->omask);
+            } else if (d->oaddr == 0) {
+                write_masked(reg[12].v, src, d->omask);
+            } else if (d->oaddr < 13) {
+                write_masked(outregs[d->oaddr], src, d->omask);
             }
         }
-        if (field(ins, 3, 0, 1)) {
-            memcpy(out->pos, opos.v, sizeof out->pos);
-            memcpy(out->d0, outregs[3], sizeof out->d0);
-            memcpy(out->d1, outregs[4], sizeof out->d1);
+        if (d->final) {
+            memcpy(out->pos, reg[12].v, sizeof out->pos);
+            /* NV2A clamps the colour outputs to 0..1 before they are
+             * interpolated (as xemu does); lit riders exceed 1 a lot. */
+            for (int k = 0; k < 4; k++) {
+                float c0 = outregs[3][k], c1 = outregs[4][k];
+                out->d0[k] = c0 > 1.0f ? 1.0f : (c0 >= 0.0f ? c0 : 0.0f);
+                out->d1[k] = c1 > 1.0f ? 1.0f : (c1 >= 0.0f ? c1 : 0.0f);
+            }
             memcpy(out->fog, outregs[5], sizeof out->fog);
             memcpy(out->tex[0], outregs[9], sizeof out->tex[0]);
             memcpy(out->tex[1], outregs[10], sizeof out->tex[1]);

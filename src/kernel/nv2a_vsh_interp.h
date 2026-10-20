@@ -43,12 +43,35 @@ void nv2a_vsh_set_start_slot(uint32_t slot);          /* _PROGRAM_START     */
 void nv2a_vsh_set_constant_load(uint32_t index);      /* _CONSTANT_LOAD     */
 void nv2a_vsh_constant_word(uint32_t word);           /* _CONSTANT(i)       */
 void nv2a_vsh_set_cxt_write(uint32_t enable);         /* _CXT_WRITE_EN      */
+int  nv2a_vsh_cxt_write(void);   /* programs may write c[]: vertex order matters */
 
 /* Run the program from the start slot on one vertex. Inputs are the ten
  * attribute values as floats. Returns 0 if there is no program to run (no
  * FINAL flag within program memory), which the caller treats as "cannot
  * transform this batch" rather than drawing garbage. */
 int  nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
+void nv2a_vsh_prepare(void);     /* decode an uploaded program; not thread-safe */
+
+/* The current program for a backend that runs it itself (on the GPU).
+ * Per instruction, from the start slot to FINAL, 8 words:
+ *   [0] mac | ilu<<4 | mac_mask<<8 | ilu_mask<<12 | tdst<<16 | omask<<20
+ *       | from_ilu<<24 | to_out<<25 | final<<26
+ *   [1] oaddr
+ *   [2..4] sources a, b, c: mux | reg<<2 | input<<6 | neg<<10 | rel<<11
+ *       | swz[0..3] at 12,14,16,18 | ci<<20 -- input is the slot in the
+ *       caller's packed inputs (in_slot), not the attribute number
+ *   [5..7] 0
+ * nin attributes are used; in_slot[a] is attribute a's slot, 0xFF unused.
+ * Semantics are nv2a_vsh_run's. */
+typedef struct {
+    uint32_t nins;
+    const uint32_t (*ins)[8];
+    const float (*consts)[4];        /* NV2A_VSH_CONSTANTS entries */
+    uint32_t nin;
+    uint8_t in_slot[NV2A_VSH_INPUTS];
+    uint32_t hash;                   /* of the program words */
+} Nv2aVshProgram;
+int  nv2a_vsh_export(Nv2aVshProgram *p);   /* 0: no program (no FINAL) */
 
 /* Direct access, for the self-test. */
 void nv2a_vsh_set_constant(uint32_t index, const float v[4]);

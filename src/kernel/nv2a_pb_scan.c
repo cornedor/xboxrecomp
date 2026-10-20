@@ -1,3 +1,4 @@
+#include "kernel.h"
 /*
  * Read-only survey of the pushbuffer a title submits.
  *
@@ -50,13 +51,17 @@ extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 extern void nv2a_pb_exec_report(void);
 static int s_exec_enabled = -1;
 
+/* (subchannel, method) -> index into s_seen + 1, so counting a word is O(1):
+ * the linear scan this replaced was a third of the executor's time. Methods
+ * are 13 bits, word aligned; subchannels 3 bits. */
+static uint16_t s_seen_idx[8 * 2048];
+
 static void note(uint32_t subch, uint32_t method)
 {
-    for (int i = 0; i < s_seen_count; i++) {
-        if (s_seen[i].method == method && s_seen[i].subch == subch) {
-            s_seen[i].count++;
-            return;
-        }
+    uint16_t *slot = &s_seen_idx[((subch & 7u) << 11) | ((method >> 2) & 0x7FFu)];
+    if (*slot && s_seen[*slot - 1].method == method && s_seen[*slot - 1].subch == subch) {
+        s_seen[*slot - 1].count++;
+        return;
     }
     if (s_seen_count >= PB_MAX_METHODS) {
         /* Silently dropping past the cap is how a truncated inventory reads as
@@ -74,12 +79,13 @@ static void note(uint32_t subch, uint32_t method)
         s_seen[s_seen_count].subch  = subch;
         s_seen[s_seen_count].count  = 1;
         s_seen_count++;
+        *slot = (uint16_t)s_seen_count;
     }
 }
 
 /* NV097 (Kelvin 3D class) methods worth naming. The point of the survey is to
  * decide what a translator has to implement, and a bare method number does not
- * answer that -- "0x1808 x412" only means something once it reads
+ * answer that -- "0x1818 x412" only means something once it reads
  * INLINE_ARRAY. Unnamed ones still get counted. */
 static const struct { uint32_t m; const char *name; } NV097_NAMES[] = {
     { 0x0000, "SET_OBJECT" },
@@ -110,7 +116,8 @@ static const struct { uint32_t m; const char *name; } NV097_NAMES[] = {
     { 0x1760, "SET_VERTEX_DATA_ARRAY_FORMAT" },
     { 0x17FC, "SET_BEGIN_END" },
     { 0x1800, "ARRAY_ELEMENT16" },
-    { 0x1808, "INLINE_ARRAY" },
+    { 0x1808, "ARRAY_ELEMENT32" },
+    { 0x1818, "INLINE_ARRAY" },
     { 0x1810, "DRAW_ARRAYS" },
     { 0x1B00, "SET_TEXTURE_OFFSET" },
     { 0x1B04, "SET_TEXTURE_FORMAT" },
@@ -222,7 +229,156 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
     return words;
 }
 
+/* Execute the main pushbuffer from GET up to PUT the way the GPU's DMA engine
+ * does, and return the new GET.
+ *
+ * nv2a_pb_scan walks a [start, end) range and stops at the first JUMP, which
+ * leaves the caller to guess where the ring wraps (the lowest and highest PUT
+ * it has seen). That holds while the title waits for every batch to be drawn;
+ * once the GPU runs asynchronously (RECOMP_NV2A_ACK_THREAD) the title fills
+ * the ring at its own pace, the guessed end goes stale, and the walk read the
+ * previous lap's leftovers -- NOPs with parameters like 106955041 among them.
+ * Following each JUMP to its target and stopping exactly at PUT needs no
+ * guess. */
+uint32_t nv2a_pb_run(uint32_t get_va, uint32_t put_va, volatile uint32_t *get_reg)
+{
+    /* The DMA pusher's method state, kept across kicks: D3D may set PUT in
+     * the middle of a method's data, and resuming there as if at a header
+     * read data words as commands -- one of them looked like a JUMP out of
+     * RAM, the walk was resynchronised past ~700 KB of commands, and the
+     * fence semaphores in them never executed. */
+    static uint32_t c_left, c_method, c_subch, c_noninc;
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t va = get_va, words = 0, jumps = 0, unknown = 0;
+
+    if (s_exec_enabled < 0)
+        s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
+    while (va != put_va) {
+        uint32_t w;
+        /* Never walk out of RAM or forever: a GET that cannot reach PUT (the
+         * title restarted the ring without a JUMP, or a jump target was not
+         * what it looked like) resynchronises at PUT instead of reading on
+         * through memory until it faults. */
+        if ((va & 0x0FFFFFFFu) >= 0x04000000u || words >= 0x200000u) {
+            static int said;
+            if (said++ < 5)
+                fprintf(stderr, "  [PB] GET 0x%08X cannot reach PUT 0x%08X (%s); resync\n",
+                        va, put_va, words >= 0x200000u ? "too long" : "out of RAM");
+            c_left = 0;
+            return put_va;
+        }
+        if (c_left) {                            /* method data */
+            note(c_subch, c_method);
+            if (s_exec_enabled)
+                nv2a_pb_exec_method(c_subch, c_method,
+                                    *(const uint32_t *)(mem + va));
+            va += 4;
+            words++;
+            if (!c_noninc)
+                c_method += 4;
+            c_left--;
+            continue;
+        }
+        /* GET moves as the commands are consumed, as on hardware -- not once
+         * the whole segment is done. D3D's blocking fence wait decides from
+         * GET whether the GPU is far enough behind to patch a wake-up NOP in
+         * at the fence's position; with GET held back for the length of a
+         * walk it patched positions this walk had already passed, the NOP
+         * never ran, and the title slept forever on its event. */
+        if (get_reg)
+            *get_reg = va & 0x0FFFFFFFu;
+        w = *(const uint32_t *)(mem + va);
+        va += 4;
+        words++;
+
+        if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
+            uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
+                                             : (w & 0x1FFFFFFCu);
+            jumps++;
+            va = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
+            continue;
+        }
+        if ((w & 0xFFFF0003u) == 0x00020000u)    /* RETURN outside a call */
+            continue;
+        if ((w & 3u) == 2u) {                    /* CALL */
+            uint32_t sub = XBOX_CONTIG_BASE | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
+            s_tot_calls++;
+            words += pb_walk(sub, sub + 0x400000u, 1, &jumps, &unknown);
+            continue;
+        }
+        if ((w & 0x00030003u) == 0u) {
+            c_left   = (w >> 18) & 0x7FFu;
+            c_subch  = (w >> 13) & 7u;
+            c_method =  w & 0x1FFCu;
+            c_noninc = (w & 0xE0000000u) == 0x40000000u;
+            continue;
+        }
+        unknown++;
+    }
+    s_tot_words += words;
+    s_tot_unknown += unknown;
+    s_tot_jumps += jumps;
+    s_tot_segments++;
+    return va;
+}
+
+static void nv2a_pb_scan_impl(uint32_t start_va, uint32_t end_va);
+
+/* RECOMP_EXEC_STATS: how much wall time execution takes. Every 5 s prints the
+ * share of time spent inside the executor, the number of batches and bytes --
+ * which says whether a slow frame is the rasteriser or something waiting. */
 void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
+{
+    static int stats = -1;
+    static LARGE_INTEGER freq, window_start;
+    static double busy_s;
+    static unsigned long calls;
+    static unsigned long long bytes;
+    LARGE_INTEGER t0, t1;
+
+    if (stats < 0) {
+        stats = getenv("RECOMP_EXEC_STATS") != NULL;
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&window_start);
+    }
+    if (!stats) {
+        nv2a_pb_scan_impl(start_va, end_va);
+        return;
+    }
+    QueryPerformanceCounter(&t0);
+    nv2a_pb_scan_impl(start_va, end_va);
+    QueryPerformanceCounter(&t1);
+    busy_s += (double)(t1.QuadPart - t0.QuadPart) / (double)freq.QuadPart;
+    calls++;
+    bytes += end_va > start_va ? end_va - start_va : 0;
+    {
+        double win = (double)(t1.QuadPart - window_start.QuadPart) / (double)freq.QuadPart;
+        if (win >= 5.0) {
+            extern void nv2a_exec_phase_take(double *, double *, double *);
+            double vsh, setup, raster;
+            nv2a_exec_phase_take(&vsh, &setup, &raster);
+            {
+                extern void nv2a_exec_flush_take(unsigned long *, unsigned long *,
+                                                 unsigned long long *, unsigned long long *);
+                unsigned long fp, fs; unsigned long long pp, ps;
+                nv2a_exec_flush_take(&fp, &fs, &pp, &ps);
+                fprintf(stderr, "  [EXEC] flushes: %lu parallel (%llu Kpx bbox), %lu serial (%llu Kpx bbox)\n",
+                        fp, pp / 1000, fs, ps / 1000);
+            }
+            fprintf(stderr, "  [EXEC] %.0f%% of %.1f s executing; %lu batches, %llu KB, %.1f ms/batch"
+                            " | vsh %.0f%% setup %.0f%% raster %.0f%% other %.0f%%\n",
+                    100.0 * busy_s / win, win, calls, bytes / 1024,
+                    calls ? 1000.0 * busy_s / calls : 0.0,
+                    100.0 * vsh / busy_s, 100.0 * setup / busy_s,
+                    100.0 * raster / busy_s,
+                    100.0 * (busy_s - vsh - setup - raster) / busy_s);
+            busy_s = 0; calls = 0; bytes = 0;
+            window_start = t1;
+        }
+    }
+}
+
+static void nv2a_pb_scan_impl(uint32_t start_va, uint32_t end_va)
 {
     uint32_t words, jumps = 0, unknown = 0;
 
